@@ -1,0 +1,117 @@
+import java.io.FileInputStream;
+import java.io.FileNotFoundException;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.util.*;
+import java.util.concurrent.ConcurrentSkipListMap;
+
+
+public interface Cache<T> {
+
+    public T getProperty(String key);
+    
+}
+
+
+
+public class CacheSkelImpl<T> implements Cache<T> {
+
+public static final String MAX_CACHE_VALIDITY_MS_PROPERTY_NAME = "MAX_CACHE_VALIDITY_MS";
+    
+    public static final long MAX_CACHE_VALIDITY_MS = 
+            Long.valueOf(
+                System.getenv(MAX_CACHE_VALIDITY_MS_PROPERTY_NAME) != null ? 
+                    System.getenv(MAX_CACHE_VALIDITY_MS_PROPERTY_NAME) :
+                    System.getProperty(MAX_CACHE_VALIDITY_MS_PROPERTY_NAME, "900000"));
+    
+    private String filename;
+    private Class<T> instanceClass;
+    
+    private Map<String, T> properties = 
+            new ConcurrentSkipListMap<String,T>(); 
+    
+    private volatile boolean loadingInProgress = false;
+    private volatile Long lastReload = null;
+   
+    public CacheSkelImpl(String string, Class<String> class1) {
+        load();
+	}
+
+	@Override
+    public T getProperty(String key) {
+        
+        long currentTime = System.currentTimeMillis();
+        
+        
+        if (lastReload + 900000l < currentTime) {
+            if(!loadingInProgress){
+                load();
+            }
+            
+        }
+        
+        return properties.get(key);
+    }
+    
+    private synchronized void load() throws IOException {
+
+        try {
+
+            loadingInProgress = true;
+
+            Properties p = new Properties();
+
+            try (FileInputStream fi = new FileInputStream(filename)) {
+                p.load(fi);
+            }
+
+            // need to remove any entries that is no longer part of the file
+            // properties
+
+            p.forEach((key, value) -> {
+                try {
+                    properties.put((String)key, 
+                            (T)instanceClass.getConstructor(String.class).newInstance(value));
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            } );
+
+            lastReload = System.currentTimeMillis();
+
+        }
+        finally {
+            loadingInProgress = false;
+        }
+
+    }
+    
+    public String toString() {
+        StringBuilder sb = new StringBuilder();
+        properties.forEach( (key, value) -> sb.append(key + " --> " + value + "\n") ); 
+        return sb.toString();
+    }
+    
+    public static void main(String[] args) throws FileNotFoundException, IOException {
+        
+        CacheSkelImpl<String> cache = new CacheSkelImpl<String>("cache.txt", String.class);
+        
+
+        
+        Properties p = new Properties();
+        for(int i=0; i<10; i++) {
+            p.put("dns-" + i, "ip-" + i);
+        }
+        
+        try (FileOutputStream fo = new FileOutputStream("cache.txt")) {
+            p.store(fo, "Cache content");
+        }
+        
+        
+        
+        cache.getProperty("dns-0");
+        
+        System.out.println("Cache content: " + cache);
+    }
+    
+}
