@@ -1,0 +1,612 @@
+var config = require("./config.json");
+var botId = Object.keys(config.credentials);
+var botName;
+var sdk = require("./lib/sdk");
+var moment = require("moment");
+var logger;
+const NLPInterceptor = require("./NLP/NLPInterceptor");
+const WebserviceUtils = require("./Webservices/Utils");
+const BotPocMappingClient = require("./Webservices/Charter/BotPocMappingClient");
+const UniversalBotDetailsClient = require("./Webservices/Kore/UniversalBotDetailsClient");
+const BotPrefetchClient = require("./Webservices/Charter/BotPrefetchClient");
+const BotEligibilityClient = require("./Webservices/Charter/BotEligibilityClient");
+const Logger = require("./Utils/Logger");
+const htmlDecoder = require('he');
+
+var apiExecutionTime;
+var commonChildBotName;
+var paymentChildBotName;
+var authChildBotName;
+var conversationLog="";
+var jsonFormattedConversationLog=[];
+
+
+async function switchIntent(data){
+	try {
+
+		var llmIntent=data.context.session.BotUserSession.UniversalBotContext.llmResponse.llmIntent;
+		var isFaq=data.context.session.BotUserSession.UniversalBotContext.llmResponse.isFaq;
+		var botName=data.context.session.BotUserSession.UniversalBotContext.llmResponse.botName;
+		var isSelfService=data.context.session.BotUserSession.UniversalBotContext.llmResponse.isSelfService;
+		var isLLMDerived=data.context.session.BotUserSession.UniversalBotContext.llmResponse.isLLMDerived;
+		var koreIntent=data.context.session.BotUserSession.UniversalBotContext.llmResponse.koreIntent;
+
+		logger.info(`Entered switchIntent Logic and llmIntent is `,llmIntent);
+		logger.info(`Entered switchIntent Logic and koreIntent is `,koreIntent);
+		logger.info(`Entered switchIntent Logic and botName is `,botName);
+
+					var uniBotId = data.botId;
+					var botEnv = config.credentials[uniBotId].env;
+
+							if(!isFaq){
+								if(isSelfService && !isLLMDerived)
+								{
+									NLPInterceptor.insertNLPMeta(data, koreIntent, botName);
+									data.context.session.BotUserSession.UniversalBotContext.environmentUB = botEnv;
+								}
+							}
+
+			} catch (error) {
+				logger.error(`Error occurred in switchIntent`,error);
+			}
+}
+
+
+async function handleCustomerMessage(customerMessage,data) {
+		logger = Logger.getLogger(data);
+		try {
+		formatMessage('CUSTOMER', customerMessage,data);
+		data.context.session.BotUserSession.UniversalBotContext.Conversation = conversationLog;
+		data.context.session.BotUserSession.UniversalBotContext.lastConversation = customerMessage;
+		logger.info(`lastConversation---------------->`, data.context.session.BotUserSession.UniversalBotContext.lastConversation);
+		logger.info(`Conversation---------------->`, data.context.session.BotUserSession.UniversalBotContext.Conversation);
+
+		
+
+		if (customerMessage!=null && data.context.session.BotUserSession.UniversalBotContext.fromAnythingElseTask === true) {
+
+			data.context.session.BotUserSession.UniversalBotContext.fromAnythingElseTask = false;
+			let value='ON'; ////Needed to change as UniversalBotContext is null
+			if(value==='ON'){//Needed to change as UniversalBotContext is null
+				await UniversalBotDetailsClient.invokeLLMService(data);
+				await switchIntent(data);	
+			}
+			else if(value==='REPORT'){ //Needed to change as UniversalBotContext is null
+				 UniversalBotDetailsClient.invokeLLMService(data);
+			}
+		}
+	} catch (error) {
+		logger.error(`Error occurred in handleCustomerMessage`,error);
+	}
+}
+
+async function handleBotMessage(botMessage,data) {
+		logger = Logger.getLogger(data);
+	try{
+		var fromTask = data.context.intentName;//Only available when coming from BOT, not from CUSTOMER.
+
+		if ((fromTask?.toLowerCase() ?? '') === "CMN_Anything_Else_Task".toLowerCase()) {
+			data.context.session.BotUserSession.UniversalBotContext.fromAnythingElseTask=true;
+		}
+		formatMessage('BOT', botMessage,data);
+	} catch (error) {
+		logger.error(`Error occurred in handleBotMessage`,error);
+	}
+}
+
+
+async function formatMessage(sender,message,data){
+	logger = Logger.getLogger(data);
+	try{
+		if (message && message.trim().length > 0) {
+			var decodedMessage = htmlDecoder.decode(message);
+
+			var msg = decodedMessage.replace(/<\/?[^>]+(>|$)/g, "");
+			msg = msg.replace(/ΓÇª/g, '')  // Replace "ΓÇª" with ellipsis
+			msg = msg.replace(/[^a-zA-Z0-9\s.,!?']/g, '')  // Remove other non-alphanumeric and non-standard punctuation characters
+			msg = msg.trim();  // Remove leading and trailing whitespace
+
+			var formattedMessage = `${sender} : ${msg}`;
+				conversationLog += formattedMessage+` `;
+
+			jsonFormattedConversationLog.push({
+				role : sender,
+				content: msg
+			});
+		data.context.session.BotUserSession.UniversalBotContext.jsonFormattedConversation = jsonFormattedConversationLog;
+		}
+	} catch (error) {
+	logger.error(`Error occurred in handleBotMessage`,error);
+}
+}
+
+async function executePrefetchHandler(prefetchResponse, data) {
+	if (prefetchResponse !== null) {
+		//Bot-Eligible & Prefetch Success
+		logger.info(`Already Bot-Eligible and Successful Prefetch Response`);
+		data.context.session.BotUserSession.UniversalBotContext.prefetchResponse = {};
+		data.context.session.BotUserSession.UniversalBotContext.prefetchResponse[prefetchResponse.intent] = prefetchResponse.intentData;
+		logger.info(`End On_Webhook - Prefetch Successful`);
+	} else {
+		//Bot-Eligible & Prefetch Failure
+		logger.error(`Already Bot-Eligible and Prefetch Failure`);
+		data.context.session.BotUserSession.UniversalBotContext.prefetchResponse = null;
+		logger.error(`Updating UniversalBotContext.prefetchResponse[null]`);
+		data.context.session.BotUserSession.UniversalBotContext.TaskEnd.APIFailure = true;
+		logger.error("Updating TaskEnd.APIfailure:[true]");
+		data.context.session.BotUserSession.UniversalBotContext.TaskEnd.Reason = "Prefetch_API_Failure";
+		logger.error("Updating TaskEnd.Reason:[Prefetch_API_Failure]");
+		logger.error(`End On_Webhook - Prefetch Failed`);
+	}
+}
+
+async function filterCommonBotName(publishedBot) {
+	let commonChildBotName;
+	publishedBot.forEach((bot) => {
+		if (bot.botName.includes("Common") || bot.botName.includes("common")) {
+			commonChildBotName = bot.botName;
+		}
+	});
+	return commonChildBotName;
+}
+async function filterPaymentBotName(publishedBot) {
+	let paymentChildBotName;
+	publishedBot.forEach((bot) => {
+		if (bot.botName.toLowerCase().includes("payment")) {
+			paymentChildBotName = bot.botName;
+		}
+	});
+	return paymentChildBotName;
+}
+
+async function filterAuthBotName(publishedBot) {
+	let authChildBotName;
+	publishedBot.forEach((bot) => {
+		if (bot.botName.toLowerCase().includes("auth")) {
+			authChildBotName = bot.botName;
+		}
+	});
+	return authChildBotName;
+}
+
+/**
+ * Method determines if the destination bot is within the list of universal bot child bots. Warns of not following O, P, V convention on child bot naming.
+ * @param publishedBot - Universal Bot Details response.
+ * @param destinationBotName - Requested destination bot from BotPocMapping API.
+ * @returns {Promise<null>}
+ */
+async function matchingChildBot(publishedBot, destinationBotName) {
+	let linkedBotsList = [];
+	let matchedChildBotName = null;
+	publishedBot.forEach((bot) => {
+		linkedBotsList.push(bot.botName);
+	});
+	logger.info(`linkedBotsList:[${linkedBotsList.toString()}]`);
+	linkedBotsList.forEach((bot) => {
+		if(bot.includes(destinationBotName)) {
+			logger.info(`Found match for ${destinationBotName} in linkedBotsList`);
+			matchedChildBotName = bot;
+			logger.info(`matchedChildBotName:[${matchedChildBotName}]`);
+		}
+	});
+	if(matchedChildBotName === null) {
+		logger.error(`No Match found for ${destinationBotName} in linkedBotsList`);
+	}
+	//End Matching Logic
+
+	//O, P, V Standard Enforcement Check
+	let lastTwoChars = null;
+	let enforcementList = ["_O", "_P", "_V"];
+	linkedBotsList.forEach((bot) => {
+		lastTwoChars = bot.slice(-2);
+		if(!enforcementList.includes(lastTwoChars)) {
+			logger.error(`Bot:[${bot}] is not following O, P, V standard`);
+		}
+	});
+
+	return matchedChildBotName;
+}
+
+let hasFetchedUniversalBotDetails = false;
+let universalBotDetailsResponse = null;
+let isRefreshingCache = false;
+async function fetchUniversalBotDetails(data) {
+	logger.info(`Fetching Universal Bot Details for bot: [${data.botId}]`);
+	isRefreshingCache = true;
+	let response;
+	try {
+		response = await UniversalBotDetailsClient.execute(data);
+	} catch(err) {
+		logger.error(`Error from UniversalBotDetailsClient: [${err.message}]`);
+		isRefreshingCache = false;
+	}
+	isRefreshingCache = false;
+	if (response !== null && response !== undefined) {
+		apiExecutionTime = moment();
+		universalBotDetailsResponse = response;
+		hasFetchedUniversalBotDetails = true;
+		logger.info(`hasFetchedUniversalBotDetails:[${hasFetchedUniversalBotDetails}]`);
+	} else {
+		logger.error(`Error updating UniversalBotDetails cache`);
+	}
+}
+
+module.exports = {
+	botId: botId,
+	botName: botName,
+	on_user_message: async function (requestId, data, callback) {
+
+		logger = Logger.getLogger(data);
+		logger.info(`DTMF ENABLED: ${data.context.session.BotUserSession.UniversalBotContext?.DTMFEnabledFlag ?? 'false'}`);
+		logger.info(`on_user_message Message Payload: ${data.message}`);
+
+
+		logger.info(`BotUserSession meta data:[${JSON.stringify(data.context.session.BotUserSession)}]`);
+
+		//logger.info(`HandleCustomerMessage IVRParameters:[${JSON.stringify(data.context.session.BotUserSession.callInfo.IVRParameters)}]`);
+
+		// Modifies the Message Payload if DTMF is enabled
+		if (data.context.session.BotUserSession.UniversalBotContext?.DTMFEnabledFlag) {
+			if (['0', 0].includes(data.message)) {
+				data.message = 'Agent';
+			} else if (['1', 1].includes(data.message)) {
+				data.message = 'Yes';
+			} else if (['2', 2].includes(data.message)) {
+				data.message = 'No';
+			}
+			// Resets the flag after entity value extraction so the flag must be set to true at each entity
+			data.context.session.BotUserSession.UniversalBotContext.DTMFEnabledFlag = false;
+		}
+		
+		const customerMessage = data.message;
+		//data.context.session.BotUserSession.UniversalBotContext.NLUByCustomLLMMode='ON';
+		//console.log(`on_user_message NLUByCustomLLMMode value is: [${JSON.stringify(data.context.session.BotUserSession.UniversalBotContext.NLUByCustomLLMMode)}]`);
+
+		let value='ON'; ////needed to change as UniversalBotContext is null
+		if(value!='OFF'){
+			await handleCustomerMessage(customerMessage,data);
+		}	
+		sdk.sendBotMessage(data, callback);
+	},
+	on_bot_message: async function (requestId, data, callback) {
+
+		logger = Logger.getLogger(data);
+		logger.info(`on_bot_message Message Payload: ${data.message}`);
+
+		//if (!data.context.session.BotUserSession.UniversalBotContext?.NLUByCustomLLMMode) {
+		//	data.context.session.BotUserSession.UniversalBotContext.NLUByCustomLLMMode='ON';
+		//}
+
+		const botMessage = data.message;
+		//data.context.session.BotUserSession.UniversalBotContext.NLUByCustomLLMMode='ON';
+		//console.log(`on_bot_message NLUByCustomLLMMode value is: [${JSON.stringify(data.context.session.BotUserSession.UniversalBotContext.NLUByCustomLLMMode)}]`);
+		
+		let value='ON';//needed to change as UniversalBotContext is null
+		if(value!='OFF'){
+			await handleBotMessage(botMessage,data);
+		}
+
+		sdk.sendUserMessage(data, callback);
+	},
+	on_agent_transfer: function (requestId, data, callback) {
+		return callback(null, data);
+	},
+	on_event: async function (requestId, data, callback) {
+		logger = Logger.getLogger(data);
+		let uniBotId = data.botId;
+		botName = config.credentials[uniBotId].name;
+		let botEnv = config.credentials[uniBotId].env;
+
+		const matchDialogEndReason = endReason => {
+			return endReason.includes('Fulfilled') ||
+				endReason.includes('Cancelled') ||
+				endReason.includes('Failed');
+		};
+
+		const matchTaskEndReason = taskName => {
+			return taskName.includes("agent transfer") ||
+				taskName.includes("call end") ||
+				taskName.includes("paymentportal") ||
+				taskName.includes("api failure") ||
+				taskName.includes("goodbye") ||
+				taskName.includes("fallback task");
+		};
+
+		logger.info("Entered On Event");
+		let botMappingPoc = data.context.session.BotUserSession.POC;	//Will need to update
+		logger.info(`botMappingPoc:[${botMappingPoc}]`);
+		logger.debug("Bot Environment", botEnv);
+		logger.debug(uniBotId);
+		logger.debug("data.context.bot", data.context.bot);
+		logger.debug(`hasFetchedUniversalBotDetails: [${hasFetchedUniversalBotDetails}]`);
+		logger.debug("Kore Base Url", data.context.session.BotUserSession.UniversalBotContext.KoreBaseUrl);
+
+		let currentTime = moment();
+		logger.debug(`Time difference: [${currentTime.diff(apiExecutionTime, 'minutes')}]`);
+		//logger.debug(`eventType:[${data.event.eventType}]`);
+		logger.info("API Timeout ", data.context.session.BotUserSession.UniversalBotContext.apiTimeout);
+
+		if ((!hasFetchedUniversalBotDetails || currentTime.diff(apiExecutionTime, 'minutes') > 3) && !isRefreshingCache) {
+			await fetchUniversalBotDetails(data);
+			logger.info("***Completed Fetch of Uni-Bot Details***");
+			commonChildBotName = await filterCommonBotName(universalBotDetailsResponse.publishedBots);
+			logger.info("common child bot name - ", commonChildBotName);
+			paymentChildBotName = await filterPaymentBotName(universalBotDetailsResponse.publishedBots);
+			authChildBotName = await filterAuthBotName(universalBotDetailsResponse.publishedBots);
+		}
+		data.context.session.BotUserSession.UniversalBotContext.linkedBotsList = universalBotDetailsResponse.publishedBots.map(x => x.botName);
+
+		//let sessionId = data.context.session.BotUserSession.callInfo.IVRParameters.UCID;
+		let sessionId = data.context.session.BotUserSession.UCID;
+
+		logger.debug(`Session_Id:[${sessionId}]`);
+		var userId = data.context.session.BotUserSession.channels[0].from;
+
+		logger.debug(`Event: ${JSON.stringify(data.event)}`);
+		logger.debug(`eventType:[${JSON.stringify(data.event.eventType)}]`);
+		if (data.event.eventType === "sessionClosure") {
+			logger.info(`sessionClosure Event`);
+			return callback(null, data);
+		}
+		if (data.event.eventType === "endDialog") {
+			let fromChild = data.context.bot;
+			let fromTask = data.event.completedTaskName;
+			logger.info(`${userId} - From Child: ${fromChild}, From Task: ${fromTask}`);
+
+			//Logic to send user to Bot Intent using mapped POC after completion of OnConnect Task.
+			if (fromTask.toLowerCase() === "CommonOnConnect".toLowerCase()) {
+				logger.info("Entered CommonOnConnect Logic");
+				logger.info(`Bot_POCMapping_URL: ${data.context.session.BotUserSession.UniversalBotContext.BotPocMappingUrl}`);
+				const botPocMappingResponse = await BotPocMappingClient.execute(data);
+				logger.info(`Bot POC Mapping Response: ${JSON.stringify(botPocMappingResponse)}`);
+				if (botPocMappingResponse !== null) {
+					let matchedChildBotName = null;
+					//Catches if botPocMapping API returned invalid data for comparison. - Triggers Agent Transfer if result is invalid.
+					try {
+						matchedChildBotName = await matchingChildBot(universalBotDetailsResponse.publishedBots, botPocMappingResponse.destinationBotName);
+					} catch (error) {
+						logger.error(`Invalid Response from BotPocMapping API - Cannot Access destinationBotName`);
+						logger.error(error);
+					}
+
+					if (!matchedChildBotName) {
+						//Negative Path - No match could be found with BotPocMapping API - Send user to Agent Transfer Task.
+						logger.error("No Match - Child Bot Name with BotPocMapping API");
+						NLPInterceptor.insertAgentTransfer(data, commonChildBotName);
+						data.message = "Agent Transfer";
+						data.context.session.BotUserSession.UniversalBotContext.Reporting.taskName = botPocMappingResponse.destinationBotIntent;
+						logger.info(`Updated UniversalBotContext.Reporting.taskName to:[${data.context.session.BotUserSession.UniversalBotContext.Reporting.taskName}]`);
+						data.context.session.BotUserSession.UniversalBotContext.TaskEnd.screenPopUp = true;
+						logger.info(`Updated UniversalBotContext.TaskEnd.screenPopUp to:[${data.context.session.BotUserSession.UniversalBotContext.TaskEnd.screenPopUp}]`);
+						data.context.session.BotUserSession.UniversalBotContext.initialDefaultVDN = botPocMappingResponse.defaultVDN;
+						logger.info(`Updated UniversalBotContext.initialDefaultVDN to:[${data.context.session.BotUserSession.UniversalBotContext.initialDefaultVDN}]`);
+					} else {
+						//Positive Path - Valid Match Found - Send user to correct Bot intent based on POC.
+						logger.info(`Valid Child Bot Match with BotPocMapping API`);
+						NLPInterceptor.insertNLPMeta(data, botPocMappingResponse.destinationBotIntent, matchedChildBotName);
+						data.message = botPocMappingResponse.destinationBotIntent;
+						data.context.session.BotUserSession.UniversalBotContext.initialDefaultVDN = botPocMappingResponse.defaultVDN;
+						logger.info(`Updating UniversalBotContext.initialDefaultVDN to:[${botPocMappingResponse.defaultVDN}] using BotPocMappingResponse`);
+						data.context.session.BotUserSession.UniversalBotContext.environmentUB = botEnv;	//Not sure what this is used for? - 3/4/2024
+					}
+					//Return Callback to Kore Platform
+					logger.info(`End On_Event - Returning Callback to Kore Platform`);
+					sdk.sendBotMessage(data, callback);
+				} else {
+					//BotPocMapping API Failure Handling
+					logger.info(`Handling BotPocMapping NON 200 Response`);
+					NLPInterceptor.insertAPIFailure(data, commonChildBotName);
+					data.message = "API Failure";
+					data.context.session.BotUserSession.UniversalBotContext.TaskEnd.APIFailure = true;
+					data.context.session.BotUserSession.UniversalBotContext.TaskEnd.Reason = "BotPocMapping_API_Failure";
+					data.context.session.BotUserSession.UniversalBotContext.initialDefaultVDN = null;
+					logger.info(`End On_Event - Returning Callback to Kore Platform`);
+					sdk.sendBotMessage(data, callback);
+				}
+			}
+			//Payment Bot Interuptions handling - Looking for all Fulfilled reasons along with different transition type to other bots.
+			// Includes two billing tasks where a payment offer is made
+			else if((data.context.endOfTask.endOfTaskReason.includes("Fulfilled") || data.context.endOfTask.endOfTaskReason.includes("Cancelled")) && (data.context.endOfTask.lastNodeName.includes("_PAY") || (["Balance Inquiry Delinquent", "Increased Bill Balance Readback Prep"].includes(data.context.endOfTask.taskName)))) {
+				console.log("endOfTask:[" + JSON.stringify(data.context.endOfTask) + "]");
+				//Logic to redirect user to Task End post fulfilment of Self-Service / FAQ.
+				logger.info("End Of Task Is Triggered - Payment");
+				try {
+					NLPInterceptor.insertTaskEnd(data, commonChildBotName);
+					logger.info(`commonChildBotName:[${commonChildBotName}]`);
+					data.message = "Task End";
+					//Return Callback to Kore Platform
+					sdk.sendBotMessage(data, callback);
+				} catch (err) {
+					logger.error(`${userId} - Task End Handler - Failed at Unsupported Bot event with message ${err.message}`);
+					//Return Callback to Kore Platform
+					return callback(null, data);
+				}
+			}
+			else if (((["Fulfilled_LinkedDialog", "Fulfilled", "Cancelled_LinkedDialog_Initiated"].includes(data.event.endReason))) && matchTaskEndReason(data.event.completedTaskName)) {
+				//Logic to prevent loops in Task End Task post completion of call ending task.
+				logger.info('IN FULLFILLED/FULLFILLED_LINKED DIALOG CHECK');
+				logger.debug(`Event:[${JSON.stringify(data.event)}]`);
+				logger.info(`Call Transfer / Termination Event Recieved of type:[${data.event.completedTaskName}]`);
+				//Return Callback to Kore Platform
+				return callback(null, data);
+			}
+			else if (["Failed_ExceededEntityRetries", "Failed_ExceededRepeatEventRetries"].includes(data.event.endReason)) {
+
+				logger.error(`Incorrect max retry settings configured at ${data.context.endOfTask.lastNodeName}`);
+				logger.info(`End Reason: ${data.event.endReason}`);
+				logger.info(`Event: ${JSON.stringify(data.event)}`);
+				logger.info(`endOfTask: ${JSON.stringify(data.context.endOfTask)}`);
+				//Return Callback to Kore Platform
+				return callback(null, data);
+
+			}
+			// for triggering anything else dialog in common bot after automation
+			else if (
+				data.context.endOfTask.endOfTaskReason === "Fulfilled" &&
+				!data.context.endOfTask.taskName.includes("_") &&
+				data.context.endOfTask.taskName != "Welcome Task"
+			) {
+				//Logic to redirect user to Task End post fulfilment of Self-Service / FAQ.
+				logger.info("End Of Task Is Triggered");
+				try {
+					    if(data.context.session.BotUserSession.UniversalBotContext.isGenAINode===true){// Need to change
+                    		data.context.entities.User_Response_EN=" ";
+                    		await UniversalBotDetailsClient.invokeLLMService(data);
+                    		let botName=data.context.session.BotUserSession.UniversalBotContext.llmResponse.botName;
+                    		let llmIntent=data.context.session.BotUserSession.UniversalBotContext.llmResponse.koreIntent;
+
+                    		NLPInterceptor.insertNLPMeta(data, llmIntent, botName);
+                    	}
+                    	else{
+                    		NLPInterceptor.insertTaskEnd(data, commonChildBotName);
+                    	}
+                    	logger.info(`commonChildBotName:[${commonChildBotName}]`);
+                    	data.message = "Task End";
+                    	//Return Callback to Kore Platform
+                    	sdk.sendBotMessage(data, callback);
+
+				} catch (err) {
+					logger.error(`${userId} - Task End Handler - Failed at Unsupported Bot event with message ${err.message}`);
+					//Return Callback to Kore Platform
+					return callback(null, data);
+				}
+			}
+			else if ('Fulfilled_Event'.includes(data.event.endReason)) {
+				// Check for when there is an end of dialog after an entity node with no message returned by bot
+				logger.error('Message not returned by platform error');
+				logger.info(`End Reason: ${data.event.endReason}`);
+				logger.info(`Event: ${JSON.stringify(data.event)}`);
+				logger.info(`endOfTask: ${JSON.stringify(data.context.endOfTask)}`);
+				//Return Callback to Kore Platform
+				return callback(null, data);
+
+			}
+			else if (matchDialogEndReason(data.event.endReason)) {
+
+				logger.info(`IN ${data.event.endReason.split('_')[0].toUpperCase()} CHECK`);
+				logger.info(`End Reason: ${data.event.endReason}`);
+				logger.info(`Event: ${JSON.stringify(data.event)}`);
+				logger.info(`endOfTask: ${JSON.stringify(data.context.endOfTask)}`);
+
+				//Return Callback to Kore Platform
+				return callback(null, data);
+
+			}
+			else {
+
+				//CHECK LOGIC - Agent Transfer Needed?
+				logger.error(`${userId} - Unsupported Bot event`);
+				logger.info(`Event: ${JSON.stringify(data.event)}`);
+				logger.info(`endOfTask: ${JSON.stringify(data.context.endOfTask)}`);
+				//Return Callback to Kore Platform
+				return callback(null, data);
+			}
+		} else {
+			// Logic to check for event other than endDialog
+			logger.error(`Unsupported Event Type: ${data.event.eventType}`);
+			return callback(null, data);
+		}
+	},
+	/**
+	 * Notes: Cannot interact with NLP from webhook event.
+	 * @param requestId
+	 * @param data - Bot context
+	 * @param componentName
+	 * @param callback
+	 * @returns {Promise<void>}
+	 */
+	on_webhook: async function (requestId, data, componentName, callback) {
+		logger = Logger.getLogger(data);
+		logger.info("Entered On_Webhook");
+		logger.info(`Universal_Bot_Env: ${data.context.session.BotUserSession.UniversalBotContext.environmentUB}`);
+		let childBot = data.context.bot;
+		let eligibleChildBots = data.context.session.BotUserSession.UniversalBotContext.isEligible;	//Array of Bot-Eligible bots.
+		data.context.session.BotUserSession.UniversalBotContext.makeAPaymentDynamicIntentPath = `${paymentChildBotName}.Make a Payment`;	//CCTIVR-8741 - Allows for Dynamic Intent to Make a Payment
+		data.context.session.BotUserSession.UniversalBotContext.authDynamicIntentPath = `${authChildBotName}.Process Automation`; // for going to auth bot for any authentication handling
+		logger.info(`makeAPaymentDynamicIntentPath:[${data.context.session.BotUserSession.UniversalBotContext.makeAPaymentDynamicIntentPath}]`);
+
+		logger.info(`eligibleChildBots:[${eligibleChildBots}]`);
+		logger.info(`childBot:[${childBot}]`);
+		logger.info(`context_intent:[${data.context.intent}]`);
+		logger.info(`context_intent_session:[${data.context.session.BotUserSession.intent}]`);
+		logger.info(`IVRParameters:[${JSON.stringify(data.context.session.BotUserSession.callInfo.IVRParameters)}]`);
+		logger.info(`Prefetch_URL: ${data.context.session.BotUserSession.UniversalBotContext.PrefetchUrl}`);
+		logger.info(`Universal_Bot_Env: ${data.context.session.BotUserSession.UniversalBotContext.environmentUB}`);
+		logger.info(`API Timeout:[${WebserviceUtils.getApiTimeout(data)}]`);
+		logger.info(`Resetting AnythingElseText`);
+
+		if (eligibleChildBots.length === 0) {
+			//First Prefetch Request Event  - So assume eligible from MOD IVR
+			logger.info(`Assuming Bot-Eligible as eligibleChildBots is empty`);
+			let prefetchResponse = await BotPrefetchClient.execute(data);
+			await executePrefetchHandler(prefetchResponse, data);
+			eligibleChildBots.push(childBot);
+			data.context.session.BotUserSession.UniversalBotContext.isEligible = eligibleChildBots;
+			logger.info(`eligibleChildBots:[${eligibleChildBots}]`);
+		} else {
+			//Not first Prefetch Request Event - Cannot assume Bot-Eligible
+			let isBotEligible;
+			let suffixRemovedChildBot = childBot.replace(/_O$|_V$|_P$/, "");
+			if(eligibleChildBots.includes(childBot)) {
+				logger.info(`Not first Prefetch Request Event - Cannot assume Bot-Eligible`);
+				//Bot-Eligible Array contains childBot - No Bot-Eligibility Required
+				let prefetchResponse = await BotPrefetchClient.execute(data);
+				await executePrefetchHandler(prefetchResponse, data);
+			} else {
+				//Bot-Eligible Array does not contain childBot - Bot-Eligibility WS Call Required
+				let botEligibilityResponse = await BotEligibilityClient.execute(data);
+				if(botEligibilityResponse !== null) {
+					//Bot-Eligibility WS Success
+					isBotEligible = botEligibilityResponse.botEligFlag.toString().toLowerCase(); //Normalizing Bot-Eligible response
+					if(isBotEligible === "true") {
+						//Bot-Eligibility WS Returned true - Perform prefetch
+						logger.info(`Bot-Eligibility WS Returned true - Perform prefetch`);
+						let prefetchResponse = await BotPrefetchClient.execute(data);
+						await executePrefetchHandler(prefetchResponse, data);
+						eligibleChildBots.push(childBot);
+						data.context.session.BotUserSession.UniversalBotContext.isEligible = eligibleChildBots;
+						logger.info(`eligibleChildBots:[${eligibleChildBots}]`);
+					} else {
+						//Bot-Eligibility Returned false - Agent Transfer
+						logger.info(`Bot-Eligibility Returned false - Agent Transfer`);
+						logger.info(`isBotEligible:[${isBotEligible}]`);
+						logger.info(`${suffixRemovedChildBot} Ineligible`);
+						data.context.session.BotUserSession.UniversalBotContext.TaskEnd.Action = "AgentTransfer";
+						logger.info("TaskEnd.Action:[AgentTransfer]");
+						if(suffixRemovedChildBot.toLowerCase().includes("payment")) {
+							data.context.session.BotUserSession.UniversalBotContext.TaskEnd.isPaymentBotIneligible = true;	//For payment bot payment portal handling - CCTIVR-8741
+							logger.info(`isPaymentBotIneligible:[true]`);
+						}
+						data.context.session.BotUserSession.UniversalBotContext.TaskEnd.Reason = "BotEligibility_Flag_False";
+						logger.info("TaskEnd.Reason:[BotEligibility_Flag_False]");
+						data.context.session.BotUserSession.UniversalBotContext.prefetchResponse = null;
+						logger.info(`Bot-Ineligible For Intent: [${data.context.intent}]`);
+						data.context.session.BotUserSession.UniversalBotContext.Reporting.taskName = data.context.intent;
+						logger.info(`Reporting.taskName:[${data.context.intent}]`);
+						logger.info(`End On_Webhook - Bot-Eligibility Returned false`);
+					}
+				} else {
+					//Bot-Eligibility WS Failure
+					logger.info(`Bot-Eligibility WS Failure`);
+					data.context.session.BotUserSession.UniversalBotContext.TaskEnd.APIFailure = true;
+					logger.info("TaskEnd.APIFailure:[true]");
+					if(suffixRemovedChildBot.toLowerCase().includes("payment")) {
+						data.context.session.BotUserSession.UniversalBotContext.TaskEnd.isPaymentBotIneligible = true;	//For payment bot payment portal handling - CCTIVR-8741
+						logger.info(`isPaymentBotIneligible:[true]`);
+					}
+					data.context.session.BotUserSession.UniversalBotContext.TaskEnd.Reason = "BotEligibility_API_FAILURE";
+					logger.info("TaskEnd.Reason:[Bot_Eligibility_API_Failure]");
+					data.context.session.BotUserSession.UniversalBotContext.prefetchResponse = null;
+					logger.info(`UniversalBotContext.prefetchResponse set to null`);
+					//Return Callback to Kore Platform
+					logger.info(`End On_Webhook - Bot-Eligibility WS Failed`);
+				}
+			}
+		}
+		//Return Callback to Kore Platform
+		return callback(null, data);
+	},
+	on_alert: function (requestId, data, callback) {
+		return sdk.sendAlertMessage(data, callback);
+	}
+};
